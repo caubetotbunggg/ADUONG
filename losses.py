@@ -96,6 +96,7 @@ def compute_rgb_loss(
     config: Optional[LossConfig] = None,
     conf_thresh: ThreshType = 0.7,
     teacher_images: Optional[torch.Tensor] = None,
+    rgb_pseudo_targets: Optional[List[Dict[str, torch.Tensor]]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Phase 1 RGB supervised loss.
@@ -120,11 +121,12 @@ def compute_rgb_loss(
         log["p1_gt_loss"] = gt_loss.item()
 
     # --- Optional pseudo-label loss from rgb_teacher (off by default in warmup) ---
-    if rgb_teacher is not None and config.p1_pseudo_weight > 0.0:
-        with torch.no_grad():
-            pseudo_preds = rgb_teacher(t_images)
-        pseudo_targets = filter_pseudo_labels(pseudo_preds, conf_thresh)
-        pseudo_loss = _sum_loss_dict(student(images, pseudo_targets)) * config.p1_pseudo_weight
+    if (rgb_teacher is not None or rgb_pseudo_targets is not None) and config.p1_pseudo_weight > 0.0:
+        if rgb_pseudo_targets is None:
+            with torch.no_grad():
+                pseudo_preds = rgb_teacher(t_images)
+            rgb_pseudo_targets = filter_pseudo_labels(pseudo_preds, conf_thresh)
+        pseudo_loss = _sum_loss_dict(student(images, rgb_pseudo_targets)) * config.p1_pseudo_weight
         components.append(pseudo_loss)
         log["p1_pseudo_loss"] = pseudo_loss.item()
 
@@ -147,6 +149,8 @@ def compute_rgb_mid_loss(
     config: Optional[LossConfig] = None,
     conf_thresh: ThreshType = 0.7,
     teacher_images: Optional[torch.Tensor] = None,      # teacher sees this (weak aug)
+    rgb_pseudo_targets: Optional[List[Dict[str, torch.Tensor]]] = None,
+    ir_pseudo_targets: Optional[List[Dict[str, torch.Tensor]]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Phase 2 mixed-batch loss.
@@ -174,19 +178,21 @@ def compute_rgb_mid_loss(
 
     # --- rgb_teacher pseudo on whole batch ---
     if config.p2_rgb_teacher_weight > 0.0:
-        with torch.no_grad():
-            preds = rgb_teacher(t_images)
-        pseudo = filter_pseudo_labels(preds, conf_thresh)
-        loss = _sum_loss_dict(student(mixed_images, pseudo)) * config.p2_rgb_teacher_weight
+        if rgb_pseudo_targets is None:
+            with torch.no_grad():
+                preds = rgb_teacher(t_images)
+            rgb_pseudo_targets = filter_pseudo_labels(preds, conf_thresh)
+        loss = _sum_loss_dict(student(mixed_images, rgb_pseudo_targets)) * config.p2_rgb_teacher_weight
         components.append(loss)
         log["p2_rgb_teacher_loss"] = loss.item()
 
     # --- ir_teacher pseudo on whole batch ---
     if config.p2_ir_teacher_weight > 0.0:
-        with torch.no_grad():
-            preds = ir_teacher(t_images)
-        pseudo = filter_pseudo_labels(preds, conf_thresh)
-        loss = _sum_loss_dict(student(mixed_images, pseudo)) * config.p2_ir_teacher_weight
+        if ir_pseudo_targets is None:
+            with torch.no_grad():
+                preds = ir_teacher(t_images)
+            ir_pseudo_targets = filter_pseudo_labels(preds, conf_thresh)
+        loss = _sum_loss_dict(student(mixed_images, ir_pseudo_targets)) * config.p2_ir_teacher_weight
         components.append(loss)
         log["p2_ir_teacher_loss"] = loss.item()
 
@@ -209,6 +215,8 @@ def compute_mid_ir_loss(
     config: Optional[LossConfig] = None,
     conf_thresh: ThreshType = 0.7,
     teacher_images: Optional[torch.Tensor] = None,       # teacher sees this (weak aug)
+    rgb_pseudo_targets: Optional[List[Dict[str, torch.Tensor]]] = None,
+    ir_pseudo_targets: Optional[List[Dict[str, torch.Tensor]]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Phase 3 mixed-batch loss.
@@ -238,19 +246,21 @@ def compute_mid_ir_loss(
 
     # --- rgb_teacher pseudo on whole batch ---
     if config.p3_rgb_teacher_weight > 0.0:
-        with torch.no_grad():
-            preds = rgb_teacher(t_images)
-        pseudo = filter_pseudo_labels(preds, conf_thresh)
-        loss = _sum_loss_dict(student(mixed_images, pseudo)) * config.p3_rgb_teacher_weight
+        if rgb_pseudo_targets is None:
+            with torch.no_grad():
+                preds = rgb_teacher(t_images)
+            rgb_pseudo_targets = filter_pseudo_labels(preds, conf_thresh)
+        loss = _sum_loss_dict(student(mixed_images, rgb_pseudo_targets)) * config.p3_rgb_teacher_weight
         components.append(loss)
         log["p3_rgb_teacher_loss"] = loss.item()
 
     # --- ir_teacher pseudo on whole batch ---
     if config.p3_ir_teacher_weight > 0.0:
-        with torch.no_grad():
-            preds = ir_teacher(t_images)
-        pseudo = filter_pseudo_labels(preds, conf_thresh)
-        loss = _sum_loss_dict(student(mixed_images, pseudo)) * config.p3_ir_teacher_weight
+        if ir_pseudo_targets is None:
+            with torch.no_grad():
+                preds = ir_teacher(t_images)
+            ir_pseudo_targets = filter_pseudo_labels(preds, conf_thresh)
+        loss = _sum_loss_dict(student(mixed_images, ir_pseudo_targets)) * config.p3_ir_teacher_weight
         components.append(loss)
         log["p3_ir_teacher_loss"] = loss.item()
 
@@ -270,6 +280,7 @@ def compute_ir_loss(
     config: Optional[LossConfig] = None,
     conf_thresh: ThreshType = 0.7,
     teacher_images: Optional[torch.Tensor] = None,
+    ir_pseudo_targets: Optional[List[Dict[str, torch.Tensor]]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Phase 4 IR unsupervised loss — ir_teacher pseudo-labels only.
@@ -284,11 +295,12 @@ def compute_ir_loss(
     t_images = teacher_images if teacher_images is not None else ir_images
     log: Dict[str, float] = {}
 
-    with torch.no_grad():
-        ir_preds = ir_teacher(t_images)
-    ir_pseudo = filter_pseudo_labels(ir_preds, conf_thresh)
+    if ir_pseudo_targets is None:
+        with torch.no_grad():
+            ir_preds = ir_teacher(t_images)
+        ir_pseudo_targets = filter_pseudo_labels(ir_preds, conf_thresh)
 
-    total_loss = _sum_loss_dict(student(ir_images, ir_pseudo)) * config.p4_ir_teacher_weight
+    total_loss = _sum_loss_dict(student(ir_images, ir_pseudo_targets)) * config.p4_ir_teacher_weight
 
     log["p4_ir_teacher_loss"] = total_loss.item()
     log["p4_total_loss"]      = total_loss.item()

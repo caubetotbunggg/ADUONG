@@ -18,9 +18,28 @@ from dataclasses import dataclass, field
 
 @dataclass
 class EMAConfig:
-    """Exponential Moving Average settings for teacher update."""
-    alpha: float = 0.999          # EMA decay factor (higher = slower teacher update)
-    use_warmup: bool = True       # ramp alpha up during early training
+    """Teacher update settings: classic EMA or adaptive EMA (AEMA)."""
+    mode: str = "aema"            # "aema" (DDT-style) or "ema" (classic)
+    alpha: float = 0.999          # classic EMA decay factor
+    use_warmup: bool = True       # ramp classic EMA alpha up during early training
+
+    # AEMA dual-rate update (DDT defaults for City2Foggy-style runs)
+    aema_fast_alpha: float = 0.997
+    aema_slow_alpha: float = 0.9996
+    aema_top_ratio: float = 0.10
+    aema_update_interval: int = 2
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"ema", "aema"}:
+            raise ValueError("EMAConfig.mode must be 'ema' or 'aema'")
+        for name in ("alpha", "aema_fast_alpha", "aema_slow_alpha"):
+            value = getattr(self, name)
+            if not 0.0 <= value < 1.0:
+                raise ValueError(f"EMAConfig.{name} must be in [0, 1)")
+        if not 0.0 < self.aema_top_ratio <= 1.0:
+            raise ValueError("EMAConfig.aema_top_ratio must be in (0, 1]")
+        if self.aema_update_interval < 1:
+            raise ValueError("EMAConfig.aema_update_interval must be >= 1")
 
 
 @dataclass

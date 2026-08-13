@@ -35,12 +35,13 @@ from discriminator import (
     compute_adv_loss,
     grl_lambda_schedule,
 )
-from ema import ema_update
+from ema import AEMAUpdater, ema_update
 from losses import (
     compute_ir_loss,
     compute_mid_ir_loss,
     compute_rgb_loss,
     compute_rgb_mid_loss,
+    filter_pseudo_labels,
 )
 from saga import SemanticAwareGrayAugmentation
 from scheduler import CurriculumScheduler, DomainStep, Phase
@@ -113,6 +114,18 @@ class CurriculumDomainAdaptationTrainer:
 
         self.saga      = SemanticAwareGrayAugmentation(apply_prob=config.saga.apply_prob)
         self.scheduler = CurriculumScheduler(config.curriculum)
+        self.rgb_aema = AEMAUpdater(
+            fast_alpha=config.ema.aema_fast_alpha,
+            slow_alpha=config.ema.aema_slow_alpha,
+            top_ratio=config.ema.aema_top_ratio,
+            update_interval=config.ema.aema_update_interval,
+        )
+        self.ir_aema = AEMAUpdater(
+            fast_alpha=config.ema.aema_fast_alpha,
+            slow_alpha=config.ema.aema_slow_alpha,
+            top_ratio=config.ema.aema_top_ratio,
+            update_interval=config.ema.aema_update_interval,
+        )
 
         # Infinite data iterators — never exhaust
         self._rgb_iter: Iterator = self._infinite(rgb_loader)
@@ -161,6 +174,8 @@ class CurriculumDomainAdaptationTrainer:
                 "PHASE1_RGB_WARMUP", teachers=["rgb", "ir"],
                 fallback_msg="PHASE1→PHASE2: no best checkpoint, using current student",
             )
+            self.rgb_aema.reset()
+            self.ir_aema.reset()
 
     def _init_teachers_from_checkpoint(
         self,
@@ -185,6 +200,52 @@ class CurriculumDomainAdaptationTrainer:
                 copy_student_to_teacher(self.rgb_teacher, self.student)
             if "ir" in teachers:
                 copy_student_to_teacher(self.ir_teacher,  self.student)
+
+    @torch.no_grad()
+    def _teacher_pseudo_labels(
+        self,
+        teacher: nn.Module,
+        images: torch.Tensor,
+        conf_thresh,
+    ) -> List[Dict[str, torch.Tensor]]:
+        was_training = teacher.training
+        teacher.eval()
+        preds = teacher(images)
+        teacher.train(was_training)
+        return filter_pseudo_labels(preds, conf_thresh)
+
+    def _teacher_update(
+        self,
+        teacher_name: str,
+        teacher: nn.Module,
+        updater: AEMAUpdater,
+        images: Optional[torch.Tensor],
+        pseudo_targets: Optional[List[Dict[str, torch.Tensor]]],
+        log: Dict,
+    ) -> None:
+        prefix = f"{teacher_name}_{self.config.ema.mode}"
+        if self.config.ema.mode == "ema":
+            ema_update(
+                teacher=teacher,
+                student=self.student,
+                alpha=self.config.ema.alpha,
+                global_step=self.global_step if self.config.ema.use_warmup else None,
+            )
+            log[f"{prefix}_updated"] = 1.0
+            return
+
+        if images is None or pseudo_targets is None:
+            log[f"{prefix}_updated"] = 0.0
+            return
+
+        aema_log = updater.accumulate_and_maybe_update(
+            teacher=teacher,
+            student=self.student,
+            images=images,
+            pseudo_targets=pseudo_targets,
+        )
+        for key, value in aema_log.items():
+            log[f"{teacher_name}_{key}"] = value
 
     # ------------------------------------------------------------------
     # Adaptive threshold
@@ -560,6 +621,17 @@ class CurriculumDomainAdaptationTrainer:
             mixed.images, mixed.targets, self.config.rgb_aug
         )
         strong_images = self._rgb_photometric_aug(weak_images.clone())
+        thresh = self._get_threshold(phase, teacher="both")
+        rgb_pseudo = None
+        ir_pseudo = None
+        if self.config.loss.p2_rgb_teacher_weight > 0.0 or (
+            self.config.ema.mode == "aema" and self.config.teacher_update.p2_update_rgb_teacher
+        ):
+            rgb_pseudo = self._teacher_pseudo_labels(self.rgb_teacher, weak_images, thresh)
+        if self.config.loss.p2_ir_teacher_weight > 0.0 or (
+            self.config.ema.mode == "aema" and self.config.teacher_update.p2_update_ir_teacher
+        ):
+            ir_pseudo = self._teacher_pseudo_labels(self.ir_teacher, weak_images, thresh)
 
         det_loss, log = compute_rgb_mid_loss(
             student=self.student,
@@ -569,8 +641,10 @@ class CurriculumDomainAdaptationTrainer:
             rgb_teacher=self.rgb_teacher,
             ir_teacher=self.ir_teacher,
             config=self.config.loss,
-            conf_thresh=self._get_threshold(phase, teacher="both"),
+            conf_thresh=thresh,
             teacher_images=weak_images,
+            rgb_pseudo_targets=rgb_pseudo,
+            ir_pseudo_targets=ir_pseudo,
         )
 
         # Adversarial alignment: disc_rgb distinguishes RGB (0) vs MID (1)
@@ -593,16 +667,22 @@ class CurriculumDomainAdaptationTrainer:
             self.disc_optimizer.step()
 
         if self.config.teacher_update.p2_update_rgb_teacher:
-            ema_update(
-                teacher=self.rgb_teacher, student=self.student,
-                alpha=self.config.ema.alpha,
-                global_step=self.global_step if self.config.ema.use_warmup else None,
+            self._teacher_update(
+                teacher_name="rgb",
+                teacher=self.rgb_teacher,
+                updater=self.rgb_aema,
+                images=weak_images[mixed.n_rgb:],
+                pseudo_targets=rgb_pseudo[mixed.n_rgb:] if rgb_pseudo is not None else None,
+                log=log,
             )
         if self.config.teacher_update.p2_update_ir_teacher:
-            ema_update(
-                teacher=self.ir_teacher, student=self.student,
-                alpha=self.config.ema.alpha,
-                global_step=self.global_step if self.config.ema.use_warmup else None,
+            self._teacher_update(
+                teacher_name="ir",
+                teacher=self.ir_teacher,
+                updater=self.ir_aema,
+                images=weak_images[mixed.n_rgb:],
+                pseudo_targets=ir_pseudo[mixed.n_rgb:] if ir_pseudo is not None else None,
+                log=log,
             )
 
         log["domain"] = "rgb_mid"
@@ -660,6 +740,17 @@ class CurriculumDomainAdaptationTrainer:
         else:
             weak_images, strong_images = weak_ir, strong_ir
             n_mid_aug = 0
+        thresh = self._get_threshold(phase, teacher="both")
+        rgb_pseudo = None
+        ir_pseudo = None
+        if self.config.loss.p3_rgb_teacher_weight > 0.0 or (
+            self.config.ema.mode == "aema" and self.config.teacher_update.p3_update_rgb_teacher
+        ):
+            rgb_pseudo = self._teacher_pseudo_labels(self.rgb_teacher, weak_images, thresh)
+        if self.config.loss.p3_ir_teacher_weight > 0.0 or (
+            self.config.ema.mode == "aema" and self.config.teacher_update.p3_update_ir_teacher
+        ):
+            ir_pseudo = self._teacher_pseudo_labels(self.ir_teacher, weak_images, thresh)
 
         det_loss, log = compute_mid_ir_loss(
             student=self.student,
@@ -669,8 +760,10 @@ class CurriculumDomainAdaptationTrainer:
             rgb_teacher=self.rgb_teacher,
             ir_teacher=self.ir_teacher,
             config=self.config.loss,
-            conf_thresh=self._get_threshold(phase, teacher="both"),
+            conf_thresh=thresh,
             teacher_images=weak_images,
+            rgb_pseudo_targets=rgb_pseudo,
+            ir_pseudo_targets=ir_pseudo,
         )
 
         # Adversarial alignment: disc_ir distinguishes MID (0) vs IR (1)
@@ -693,16 +786,22 @@ class CurriculumDomainAdaptationTrainer:
             self.disc_optimizer.step()
 
         if self.config.teacher_update.p3_update_rgb_teacher:
-            ema_update(
-                teacher=self.rgb_teacher, student=self.student,
-                alpha=self.config.ema.alpha,
-                global_step=self.global_step if self.config.ema.use_warmup else None,
+            self._teacher_update(
+                teacher_name="rgb",
+                teacher=self.rgb_teacher,
+                updater=self.rgb_aema,
+                images=weak_images[n_mid_aug:],
+                pseudo_targets=rgb_pseudo[n_mid_aug:] if rgb_pseudo is not None else None,
+                log=log,
             )
         if self.config.teacher_update.p3_update_ir_teacher:
-            ema_update(
-                teacher=self.ir_teacher, student=self.student,
-                alpha=self.config.ema.alpha,
-                global_step=self.global_step if self.config.ema.use_warmup else None,
+            self._teacher_update(
+                teacher_name="ir",
+                teacher=self.ir_teacher,
+                updater=self.ir_aema,
+                images=weak_images[n_mid_aug:],
+                pseudo_targets=ir_pseudo[n_mid_aug:] if ir_pseudo is not None else None,
+                log=log,
             )
 
         log["domain"] = "mid_ir"
@@ -721,24 +820,34 @@ class CurriculumDomainAdaptationTrainer:
 
         weak_images, _ = self._geometric_aug(batch.images, None, self.config.ir_aug)
         strong_images = self._ir_photometric_aug(weak_images.clone())
+        thresh = self._get_threshold(phase, teacher="ir")
+        ir_pseudo = None
+        if self.config.loss.p4_ir_teacher_weight > 0.0 or (
+            self.config.ema.mode == "aema" and self.config.teacher_update.p4_update_ir_teacher
+        ):
+            ir_pseudo = self._teacher_pseudo_labels(self.ir_teacher, weak_images, thresh)
 
         loss, log = compute_ir_loss(
             student=self.student,
             ir_images=strong_images,
             ir_teacher=self.ir_teacher,
             config=self.config.loss,
-            conf_thresh=self._get_threshold(phase, teacher="ir"),
+            conf_thresh=thresh,
             teacher_images=weak_images,
+            ir_pseudo_targets=ir_pseudo,
         )
 
         loss.backward()
         log["grad_norm"] = self._clip_and_step()
 
         if self.config.teacher_update.p4_update_ir_teacher:
-            ema_update(
-                teacher=self.ir_teacher, student=self.student,
-                alpha=self.config.ema.alpha,
-                global_step=self.global_step if self.config.ema.use_warmup else None,
+            self._teacher_update(
+                teacher_name="ir",
+                teacher=self.ir_teacher,
+                updater=self.ir_aema,
+                images=weak_images,
+                pseudo_targets=ir_pseudo,
+                log=log,
             )
 
         log["domain"] = "ir"
@@ -807,13 +916,16 @@ class CurriculumDomainAdaptationTrainer:
     # Checkpointing
     # ------------------------------------------------------------------
 
-    def save_checkpoint(self, path: str) -> None:
+    def save_checkpoint(self, path: str, extra_state: Optional[Dict] = None) -> None:
         ckpt = {
             "global_step": self.global_step,
             "student":     self.student.state_dict(),
             "rgb_teacher": self.rgb_teacher.state_dict(),
             "ir_teacher":  self.ir_teacher.state_dict(),
             "optimizer":   self.optimizer.state_dict(),
+            "ema_mode":    self.config.ema.mode,
+            "rgb_aema":    self.rgb_aema.state_dict(),
+            "ir_aema":     self.ir_aema.state_dict(),
         }
         if self.disc_rgb is not None:
             ckpt["disc_rgb"] = self.disc_rgb.state_dict()
@@ -821,16 +933,33 @@ class CurriculumDomainAdaptationTrainer:
             ckpt["disc_ir"] = self.disc_ir.state_dict()
         if self.disc_optimizer is not None:
             ckpt["disc_optimizer"] = self.disc_optimizer.state_dict()
+        if extra_state is not None:
+            ckpt["extra_state"] = extra_state
         torch.save(ckpt, path)
         logger.info(f"Checkpoint saved → {path}  (step {self.global_step})")
 
-    def load_checkpoint(self, path: str) -> None:
+    def load_checkpoint(self, path: str) -> Dict:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.global_step = ckpt["global_step"]
         self.student.load_state_dict(ckpt["student"])
         self.rgb_teacher.load_state_dict(ckpt["rgb_teacher"])
         self.ir_teacher.load_state_dict(ckpt["ir_teacher"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
+        if self.config.ema.mode == "aema":
+            if ckpt.get("ema_mode", "ema") == "aema":
+                if "rgb_aema" in ckpt:
+                    self.rgb_aema.load_state_dict(ckpt["rgb_aema"], self.device)
+                if "ir_aema" in ckpt:
+                    self.ir_aema.load_state_dict(ckpt["ir_aema"], self.device)
+            else:
+                logger.warning(
+                    "Checkpoint was saved with classic EMA; starting fresh AEMA accumulators."
+                )
+        elif ckpt.get("ema_mode", "ema") != self.config.ema.mode:
+            logger.warning(
+                f"Checkpoint ema_mode={ckpt.get('ema_mode')} differs from current "
+                f"ema_mode={self.config.ema.mode}; ignoring updater state."
+            )
         if self.disc_rgb is not None and "disc_rgb" in ckpt:
             self.disc_rgb.load_state_dict(ckpt["disc_rgb"])
         if self.disc_ir is not None and "disc_ir" in ckpt:
@@ -838,6 +967,7 @@ class CurriculumDomainAdaptationTrainer:
         if self.disc_optimizer is not None and "disc_optimizer" in ckpt:
             self.disc_optimizer.load_state_dict(ckpt["disc_optimizer"])
         logger.info(f"Checkpoint loaded ← {path}  (step {self.global_step})")
+        return ckpt
 
     # ------------------------------------------------------------------
     # Evaluation

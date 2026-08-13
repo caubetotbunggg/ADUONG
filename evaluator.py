@@ -340,6 +340,31 @@ class PhaseEvaluator:
         # Results history: List[{"step": int, "phase": str, "trigger": str, ...metrics}]
         self.history: List[Dict] = []
 
+    def state_dict(self) -> Dict:
+        """Serializable evaluator progress for resumable Kaggle runs."""
+        return {
+            "best_map50": self.best_map50,
+            "best_map50_per_phase": self.best_map50_per_phase,
+            "last_phase": self._last_phase.name if self._last_phase is not None else None,
+            "last_eval_step": self._last_eval_step,
+            "history": self.history,
+        }
+
+    def load_state_dict(self, state: Dict) -> None:
+        self.best_map50 = float(state.get("best_map50", -1.0))
+        self.best_map50_per_phase = dict(state.get("best_map50_per_phase", {}))
+        self._last_eval_step = int(state.get("last_eval_step", -1))
+        self.history = list(state.get("history", []))
+
+        last_phase_name = state.get("last_phase")
+        self._last_phase = None
+        if last_phase_name:
+            try:
+                from scheduler import Phase
+                self._last_phase = Phase[last_phase_name]
+            except (KeyError, ImportError):
+                logger.warning(f"Could not restore evaluator last_phase={last_phase_name}")
+
     def register_best_fn(self, fn) -> None:
         """Register a callback called when a new global best mAP@0.5 is achieved."""
         self.on_new_best_fn = fn
