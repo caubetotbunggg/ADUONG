@@ -102,9 +102,15 @@ def configure_logging(log_file: str = None) -> None:
 
 
 def _looks_like_flir_align(path: Path) -> bool:
-    return (
+    has_split_files = (
         (path / "align_train.txt").exists()
         and (path / "align_validation.txt").exists()
+    ) or (
+        (path / "ImageSets" / "Main" / "align_train.txt").exists()
+        and (path / "ImageSets" / "Main" / "align_validation.txt").exists()
+    )
+    return (
+        has_split_files
         and (path / "JPEGImages").is_dir()
         and (path / "Annotations").is_dir()
     )
@@ -116,15 +122,25 @@ def resolve_data_root(data_root: str = None) -> str:
         candidates.append(Path(data_root))
     for base in (Path("/kaggle/input/flir-aligned"), Path("/kaggle/input")):
         if base.exists():
-            candidates.extend([base, *base.glob("*"), *base.glob("*/*")])
+            candidates.append(base)
+            candidates.extend(p for p in base.rglob("*") if p.is_dir())
 
+    seen = set()
+    checked = []
     for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if len(checked) < 20:
+            checked.append(str(candidate))
         if _looks_like_flir_align(candidate):
             return str(candidate)
     raise FileNotFoundError(
         "Could not find FLIR aligned data root. Pass --data_root pointing to a "
-        "directory containing align_train.txt, align_validation.txt, JPEGImages/, "
-        "and Annotations/."
+        "directory containing JPEGImages/, Annotations/, and either root-level "
+        "align_train.txt/align_validation.txt or ImageSets/Main split files. "
+        f"Checked candidates: {checked}"
     )
 
 
@@ -141,12 +157,31 @@ def capture_rng_state() -> dict:
 def restore_rng_state(state: dict) -> None:
     if not state:
         return
-    if "python" in state:
-        random.setstate(state["python"])
-    if "torch" in state:
-        torch.set_rng_state(state["torch"])
-    if torch.cuda.is_available() and "cuda" in state:
-        torch.cuda.set_rng_state_all(state["cuda"])
+    try:
+        if "python" in state:
+            random.setstate(state["python"])
+    except Exception as exc:
+        logger.warning(f"Skipping Python RNG restore: {exc}")
+
+    try:
+        torch_state = state.get("torch")
+        if torch_state is not None:
+            if not isinstance(torch_state, torch.Tensor):
+                torch_state = torch.ByteTensor(torch_state)
+            torch.set_rng_state(torch_state.cpu().to(torch.uint8))
+    except Exception as exc:
+        logger.warning(f"Skipping torch RNG restore: {exc}")
+
+    try:
+        cuda_state = state.get("cuda")
+        if torch.cuda.is_available() and cuda_state is not None:
+            cuda_state = [
+                s if isinstance(s, torch.Tensor) else torch.ByteTensor(s)
+                for s in cuda_state
+            ]
+            torch.cuda.set_rng_state_all(cuda_state)
+    except Exception as exc:
+        logger.warning(f"Skipping CUDA RNG restore: {exc}")
 
 
 def write_metrics(path: str, phase_eval) -> None:
