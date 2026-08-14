@@ -142,7 +142,7 @@ class CurriculumDomainAdaptationTrainer:
         if config.aat.enabled:
             self.aat_generator = AATPseudoLabelGenerator(
                 epsilon=config.aat.epsilon,
-                merge_iou=config.aat.merge_iou,
+                merge_iou_threshold=config.aat.merge_iou,
             )
             logger.info(
                 f"AAT enabled: epsilon={config.aat.epsilon}  "
