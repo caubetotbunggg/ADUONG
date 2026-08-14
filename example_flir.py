@@ -304,23 +304,31 @@ def make_adaptive_threshold(
     phase4_thresh_person: float = 0.55,
     phase4_thresh_car: float = 0.65,
     phase4_thresh_bicycle: float = 0.50,
+    phase2_thresh_person: float = 0.55,
+    phase2_thresh_car: float = 0.60,
+    phase2_thresh_bicycle: float = 0.50,
+    phase3_thresh_person: float = 0.55,
+    phase3_thresh_car: float = 0.60,
+    phase3_thresh_bicycle: float = 0.50,
 ) -> AdaptiveThresholdScheduler:
     # FLIR classes: 0=person  1=car  2=bicycle
     # person: harder to detect in IR → lower threshold
     # car: most distinct in IR → higher threshold
     # bicycle: small, rare → lower threshold
     phase4_base = {0: phase4_thresh_person, 1: phase4_thresh_car, 2: phase4_thresh_bicycle}
+    phase23_base = {0: phase2_thresh_person, 1: phase2_thresh_car, 2: phase2_thresh_bicycle}
+    phase3_base = {0: phase3_thresh_person, 1: phase3_thresh_car, 2: phase3_thresh_bicycle}
     return AdaptiveThresholdScheduler(AdaptiveThresholdConfig(
         rgb_teacher=TeacherThresholds(
             phase1={0: 0.70, 1: 0.70, 2: 0.65},
-            phase2={0: 0.70, 1: 0.75, 2: 0.65},
-            phase3={0: 0.70, 1: 0.75, 2: 0.65},
+            phase2=phase23_base,
+            phase3=phase3_base,
             phase4=phase4_base,
         ),
         ir_teacher=TeacherThresholds(
             phase1={0: 0.70, 1: 0.70, 2: 0.65},
-            phase2={0: 0.70, 1: 0.75, 2: 0.65},
-            phase3={0: 0.70, 1: 0.75, 2: 0.65},
+            phase2=phase23_base,
+            phase3=phase3_base,
             phase4=phase4_base,
         ),
         phase4_ir_ramp=ThreshRampConfig(
@@ -437,6 +445,12 @@ def main(args):
         phase4_thresh_person=args.phase4_thresh_person,
         phase4_thresh_car=args.phase4_thresh_car,
         phase4_thresh_bicycle=args.phase4_thresh_bicycle,
+        phase2_thresh_person=args.phase2_thresh_person,
+        phase2_thresh_car=args.phase2_thresh_car,
+        phase2_thresh_bicycle=args.phase2_thresh_bicycle,
+        phase3_thresh_person=args.phase3_thresh_person,
+        phase3_thresh_car=args.phase3_thresh_car,
+        phase3_thresh_bicycle=args.phase3_thresh_bicycle,
     )
     logger.info("\n" + thresh.summary())
 
@@ -770,6 +784,18 @@ def parse_args():
                    help="Phase-4 IR confidence threshold for car (default 0.65)")
     p.add_argument("--phase4_thresh_bicycle", "--phase4-thresh-bicycle", type=float, default=0.50,
                    help="Phase-4 IR confidence threshold for bicycle (default 0.50)")
+    p.add_argument("--phase2_thresh_person", "--phase2-thresh-person", type=float, default=0.55,
+                   help="Phase-2 confidence threshold for person (default 0.55)")
+    p.add_argument("--phase2_thresh_car", "--phase2-thresh-car", type=float, default=0.60,
+                   help="Phase-2 confidence threshold for car (default 0.60)")
+    p.add_argument("--phase2_thresh_bicycle", "--phase2-thresh-bicycle", type=float, default=0.50,
+                   help="Phase-2 confidence threshold for bicycle (default 0.50)")
+    p.add_argument("--phase3_thresh_person", "--phase3-thresh-person", type=float, default=0.55,
+                   help="Phase-3 confidence threshold for person (default 0.55)")
+    p.add_argument("--phase3_thresh_car", "--phase3-thresh-car", type=float, default=0.60,
+                   help="Phase-3 confidence threshold for car (default 0.60)")
+    p.add_argument("--phase3_thresh_bicycle", "--phase3-thresh-bicycle", type=float, default=0.50,
+                   help="Phase-3 confidence threshold for bicycle (default 0.50)")
     p.add_argument("--merge_iou_threshold", "--merge-iou-threshold", type=float, default=0.5,
                    help="IoU threshold for teacher-student pseudo merge (default 0.5)")
     p.add_argument("--merge_student_conf_thresh", "--merge-student-conf-thresh",
