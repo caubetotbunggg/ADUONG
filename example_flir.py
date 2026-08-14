@@ -47,6 +47,7 @@ from adaptive_threshold import (
     ThreshRampConfig,
 )
 from config import (
+    AATConfig,
     AblationConfig,
     AdvConfig,
     CurriculumConfig,
@@ -217,6 +218,9 @@ def make_training_config(
     disable_teacher_student_merge: bool = False,
     merge_iou_threshold: float = 0.5,
     merge_student_conf_thresh: float = 0.7,
+    aat_enabled: bool = False,
+    aat_epsilon: float = 0.02,
+    aat_merge_iou: float = 0.5,
 ) -> TrainingConfig:
     return TrainingConfig(
         ema=EMAConfig(
@@ -295,6 +299,11 @@ def make_training_config(
             disable_aema=disable_aema,
             disable_adv=disable_adv,
             disable_teacher_student_merge=disable_teacher_student_merge,
+        ),
+        aat=AATConfig(
+            enabled=aat_enabled,
+            epsilon=aat_epsilon,
+            merge_iou=aat_merge_iou,
         ),
     )
 
@@ -479,6 +488,9 @@ def main(args):
         disable_teacher_student_merge=args.disable_teacher_student_merge,
         merge_iou_threshold=args.merge_iou_threshold,
         merge_student_conf_thresh=args.merge_student_conf_thresh,
+        aat_enabled=args.enable_aat,
+        aat_epsilon=args.aat_epsilon,
+        aat_merge_iou=args.aat_merge_iou,
     )
     logger.info(
         f"Teacher update: mode={_cfg.ema.mode}  ema_alpha={_cfg.ema.alpha}  "
@@ -764,6 +776,13 @@ def parse_args():
                    help="Resume output_dir/latest.pt automatically when it exists")
     p.add_argument("--skip_eval", "--skip-eval", action="store_true",
                    help="Skip baseline/final/periodic validation for fast smoke runs")
+    # --- AAT (Adversarial Attacked Teacher) ---
+    p.add_argument("--enable_aat", "--enable-aat", action="store_true",
+                   help="Enable statistical domain-match adversarial attacked teacher")
+    p.add_argument("--aat_epsilon", "--aat-epsilon", type=float, default=0.02,
+                   help="AAT perturbation budget (default 0.02)")
+    p.add_argument("--aat_merge_iou", "--aat-merge-iou", type=float, default=0.5,
+                   help="IoU threshold for merging clean + attacked pseudo (default 0.5)")
     p.add_argument("--device",      default="cuda",
                    choices=["cuda", "cpu", "mps"])
     # --- Ablation / debug flags ---

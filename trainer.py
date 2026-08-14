@@ -35,6 +35,7 @@ from discriminator import (
     compute_adv_loss,
     grl_lambda_schedule,
 )
+from aat import AATPseudoLabelGenerator
 from ema import AEMAUpdater, ema_update
 from losses import (
     compute_ir_loss,
@@ -136,6 +137,18 @@ class CurriculumDomainAdaptationTrainer:
             update_interval=config.ema.aema_update_interval,
         )
 
+        # AAT (Adversarial Attacked Teacher) — statistical domain match
+        self.aat_generator: Optional[AATPseudoLabelGenerator] = None
+        if config.aat.enabled:
+            self.aat_generator = AATPseudoLabelGenerator(
+                epsilon=config.aat.epsilon,
+                merge_iou=config.aat.merge_iou,
+            )
+            logger.info(
+                f"AAT enabled: epsilon={config.aat.epsilon}  "
+                f"merge_iou={config.aat.merge_iou}"
+            )
+
         # Infinite data iterators — never exhaust
         self._rgb_iter: Iterator = self._infinite(rgb_loader)
         self._ir_iter: Iterator  = self._infinite(ir_loader)
@@ -235,17 +248,25 @@ class CurriculumDomainAdaptationTrainer:
         teacher.train(was_training)
         return filter_pseudo_labels(preds, conf_thresh)
 
-    @torch.no_grad()
     def _teacher_pseudo_labels_with_raw(
         self,
         teacher: nn.Module,
         images: torch.Tensor,
         conf_thresh,
     ) -> Tuple[List[Dict[str, torch.Tensor]], List[Dict[str, torch.Tensor]]]:
-        """Return (filtered_pseudo, raw_predictions) for health monitoring."""
+        """Return (filtered_pseudo, raw_predictions) for health monitoring.
+
+        When AAT is enabled, pseudo-labels are generated from both clean
+        and adversarially attacked (IR-style) teacher predictions, then
+        merged via IoU dedup.
+        """
+        if self.aat_generator is not None:
+            return self.aat_generator.generate(teacher, images, conf_thresh)
+
         was_training = teacher.training
         teacher.eval()
-        preds = teacher(images)
+        with torch.no_grad():
+            preds = teacher(images)
         teacher.train(was_training)
         pseudo = filter_pseudo_labels(preds, conf_thresh)
         return pseudo, preds
@@ -822,6 +843,11 @@ class CurriculumDomainAdaptationTrainer:
             weak_ir, _ = self._geometric_aug(
                 mixed.ir_images, None, self.config.ir_aug
             )
+            # Update AAT IR statistics with real IR images
+            if self.aat_generator is not None:
+                self.aat_generator.update_ir_stats(
+                    weak_ir, momentum=self.config.aat.ir_stats_momentum
+                )
         else:
             weak_ir = None
 
@@ -930,6 +956,11 @@ class CurriculumDomainAdaptationTrainer:
 
         weak_images, _ = self._geometric_aug(batch.images, None, self.config.ir_aug)
         strong_images = self._ir_photometric_aug(weak_images.clone())
+        # Update AAT IR statistics with real IR images
+        if self.aat_generator is not None:
+            self.aat_generator.update_ir_stats(
+                weak_images, momentum=self.config.aat.ir_stats_momentum
+            )
         thresh = self._get_threshold(phase, teacher="ir")
         ir_pseudo = None
         ir_raw_preds = None
@@ -1045,6 +1076,9 @@ class CurriculumDomainAdaptationTrainer:
             "rgb_aema":    self.rgb_aema.state_dict(),
             "ir_aema":     self.ir_aema.state_dict(),
         }
+        if self.aat_generator is not None:
+            ckpt["aat_ir_mean"] = self.aat_generator.attacker._ir_mean
+            ckpt["aat_ir_std"] = self.aat_generator.attacker._ir_std
         if self.disc_rgb is not None:
             ckpt["disc_rgb"] = self.disc_rgb.state_dict()
         if self.disc_ir is not None:
@@ -1063,6 +1097,11 @@ class CurriculumDomainAdaptationTrainer:
         self.rgb_teacher.load_state_dict(ckpt["rgb_teacher"])
         self.ir_teacher.load_state_dict(ckpt["ir_teacher"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
+        if self.aat_generator is not None:
+            if "aat_ir_mean" in ckpt and ckpt["aat_ir_mean"] is not None:
+                self.aat_generator.attacker._ir_mean = ckpt["aat_ir_mean"].to(self.device)
+                self.aat_generator.attacker._ir_std = ckpt["aat_ir_std"].to(self.device)
+                logger.info("AAT IR statistics loaded from checkpoint")
         if self.config.ema.mode == "aema":
             if ckpt.get("ema_mode", "ema") == "aema":
                 if "rgb_aema" in ckpt:

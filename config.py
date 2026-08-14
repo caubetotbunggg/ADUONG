@@ -200,6 +200,31 @@ class TeacherUpdateConfig:
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# AAT — Adversarial Attacked Teacher config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AATConfig:
+    """
+    Statistical domain-match adversarial attacked teacher.
+
+    Perturbs teacher inputs toward the IR domain's statistical distribution
+    (mean/std) to generate additional pseudo-labels that the clean teacher
+    might miss.  No discriminator or bounding boxes needed.
+
+    enabled       : turn AAT on/off
+    epsilon       : perturbation budget (larger = more aggressive shift toward IR)
+    merge_iou     : IoU threshold for dedup when merging clean + attacked pseudo
+    ir_stats_momentum : EMA momentum for updating IR reference statistics (0.9 = slow)
+    """
+    enabled: bool = False
+    epsilon: float = 0.02
+    merge_iou: float = 0.5
+    ir_stats_momentum: float = 0.9
+
 # ---------------------------------------------------------------------------
 # Ablation / debug config
 # ---------------------------------------------------------------------------
@@ -237,6 +262,7 @@ class TrainingConfig:
     loss: LossConfig = field(default_factory=LossConfig)
     teacher_update: TeacherUpdateConfig = field(default_factory=TeacherUpdateConfig)
     adv: AdvConfig = field(default_factory=AdvConfig)
+    aat: AATConfig = field(default_factory=AATConfig)
     ablation: AblationConfig = field(default_factory=AblationConfig)
 
     pseudo_label_conf_thresh: float = 0.7   # min score to keep a pseudo-label box
