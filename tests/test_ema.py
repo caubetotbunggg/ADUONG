@@ -44,9 +44,9 @@ class AEMAUpdaterTest(unittest.TestCase):
             update_interval=1,
         )
         pseudo = [{
-            "boxes": torch.zeros(0, 4),
-            "labels": torch.zeros(0, dtype=torch.long),
-            "scores": torch.zeros(0),
+            "boxes": torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+            "labels": torch.tensor([0], dtype=torch.long),
+            "scores": torch.tensor([0.9]),
         }]
         log = updater.accumulate_and_maybe_update(
             teacher=teacher,

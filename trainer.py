@@ -39,9 +39,11 @@ from ema import AEMAUpdater, ema_update
 from losses import (
     compute_ir_loss,
     compute_mid_ir_loss,
+    compute_pseudo_health_stats,
     compute_rgb_loss,
     compute_rgb_mid_loss,
     filter_pseudo_labels,
+    select_nonempty_pseudo_targets,
 )
 from saga import SemanticAwareGrayAugmentation
 from scheduler import CurriculumScheduler, DomainStep, Phase
@@ -86,6 +88,7 @@ class CurriculumDomainAdaptationTrainer:
         threshold_scheduler: Optional["AdaptiveThresholdScheduler"] = None,
         phase_evaluator: Optional["PhaseEvaluator"] = None,
         phase1_best_path: Optional[str] = None,
+        phase2_best_path: Optional[str] = None,
         disc_rgb: Optional[nn.Module] = None,
         disc_ir:  Optional[nn.Module] = None,
         disc_optimizer: Optional[Optimizer] = None,
@@ -109,6 +112,12 @@ class CurriculumDomainAdaptationTrainer:
         self.phase_best_paths: Dict[str, str] = {}
         if phase1_best_path:
             self.phase_best_paths["PHASE1_RGB_WARMUP"] = phase1_best_path
+        if phase2_best_path:
+            self.phase_best_paths["PHASE2_RGB_MID"] = phase2_best_path
+
+        # Pseudo-label starvation tracking (diagnostic only)
+        self._starvation_streak: int = 0
+        self._starvation_warned: bool = False
 
         self._setup_models()
 
@@ -162,9 +171,12 @@ class CurriculumDomainAdaptationTrainer:
         Called exactly once when the curriculum phase changes.
 
         Phase 1 → Phase 2 :
-          Hard-copy best Phase-1 student → BOTH teachers, so they enter the
-          curriculum from the strongest RGB-pretrained weights available.
-        Other transitions : no-op (EMA continues to evolve teachers in place).
+          Hard-copy best Phase-1 student → BOTH teachers.
+        Phase 2 → Phase 3 :
+          Initialize IR teacher from best Phase-2 student (or current student
+          if no best checkpoint exists).  Reset IR AEMA statistics.
+          RGB teacher is NOT reset (continues from Phase 2).
+        Other transitions : no-op.
         """
         if from_phase is None:
             return
@@ -176,6 +188,15 @@ class CurriculumDomainAdaptationTrainer:
             )
             self.rgb_aema.reset()
             self.ir_aema.reset()
+
+        if from_phase == Phase.PHASE2_RGB_MID and to_phase == Phase.PHASE3_MID_IR:
+            self._init_teachers_from_checkpoint(
+                "PHASE2_RGB_MID", teachers=["ir"],
+                fallback_msg="PHASE2→PHASE3: no best Phase-2 checkpoint, using current student",
+            )
+            self.ir_aema.reset()
+            logger.info("[Phase Transition] Initialized IR teacher from Phase-2 student")
+            logger.info("[Phase Transition] Reset IR AEMA statistics")
 
     def _init_teachers_from_checkpoint(
         self,
@@ -214,6 +235,47 @@ class CurriculumDomainAdaptationTrainer:
         teacher.train(was_training)
         return filter_pseudo_labels(preds, conf_thresh)
 
+    @torch.no_grad()
+    def _teacher_pseudo_labels_with_raw(
+        self,
+        teacher: nn.Module,
+        images: torch.Tensor,
+        conf_thresh,
+    ) -> Tuple[List[Dict[str, torch.Tensor]], List[Dict[str, torch.Tensor]]]:
+        """Return (filtered_pseudo, raw_predictions) for health monitoring."""
+        was_training = teacher.training
+        teacher.eval()
+        preds = teacher(images)
+        teacher.train(was_training)
+        pseudo = filter_pseudo_labels(preds, conf_thresh)
+        return pseudo, preds
+
+    def _log_pseudo_health(
+        self,
+        log: Dict[str, float],
+        prefix: str,
+        raw_preds: List[Dict[str, torch.Tensor]],
+        filtered_pseudo: List[Dict[str, torch.Tensor]],
+    ) -> None:
+        """Compute and inject pseudo-label health metrics into the log dict."""
+        stats = compute_pseudo_health_stats(raw_preds, filtered_pseudo)
+        for key, val in stats.items():
+            log[f"{prefix}_{key}"] = val
+
+        # Check for pseudo-label starvation
+        empty_ratio = stats.get("pseudo_empty_image_ratio", 0.0)
+        if empty_ratio > 0.8:
+            self._starvation_streak += 1
+            if self._starvation_streak >= 10 and not self._starvation_warned:
+                logger.warning(
+                    f"WARNING: pseudo-label starvation detected: "
+                    f"{empty_ratio*100:.0f}% of target images contain no accepted pseudo labels."
+                )
+                self._starvation_warned = True
+        else:
+            self._starvation_streak = 0
+            self._starvation_warned = False
+
     def _teacher_update(
         self,
         teacher_name: str,
@@ -223,8 +285,11 @@ class CurriculumDomainAdaptationTrainer:
         pseudo_targets: Optional[List[Dict[str, torch.Tensor]]],
         log: Dict,
     ) -> None:
-        prefix = f"{teacher_name}_{self.config.ema.mode}"
-        if self.config.ema.mode == "ema":
+        # AEMA disabled → fall back to classic EMA
+        effective_mode = "ema" if self.config.ablation.disable_aema else self.config.ema.mode
+        prefix = f"{teacher_name}_{effective_mode}"
+
+        if effective_mode == "ema":
             ema_update(
                 teacher=teacher,
                 student=self.student,
@@ -238,11 +303,29 @@ class CurriculumDomainAdaptationTrainer:
             log[f"{prefix}_updated"] = 0.0
             return
 
+        # Generate student predictions for DDT-style teacher-student merge
+        student_preds = None
+        merge_enabled = not self.config.ablation.disable_teacher_student_merge
+        if merge_enabled:
+            num_pseudo_boxes = sum(
+                t["boxes"].numel() // 4 for t in pseudo_targets
+            )
+            if num_pseudo_boxes > 0:
+                with torch.no_grad():
+                    was_training = self.student.training
+                    self.student.eval()
+                    student_preds = self.student(images)
+                    self.student.train(was_training)
+
         aema_log = updater.accumulate_and_maybe_update(
             teacher=teacher,
             student=self.student,
             images=images,
             pseudo_targets=pseudo_targets,
+            student_predictions=student_preds,
+            merge_enabled=merge_enabled,
+            merge_iou_threshold=self.config.ema.merge_iou_threshold,
+            merge_student_conf_thresh=self.config.ema.merge_student_conf_thresh,
         )
         for key, value in aema_log.items():
             log[f"{teacher_name}_{key}"] = value
@@ -597,6 +680,7 @@ class CurriculumDomainAdaptationTrainer:
         loss.backward()
         log["grad_norm"] = self._clip_and_step()
         log["domain"] = "rgb"
+        log["adversarial_loss"] = 0.0
         return log
 
     def train_rgb_mid_step(self, phase: Phase = Phase.PHASE2_RGB_MID) -> Dict:
@@ -621,17 +705,22 @@ class CurriculumDomainAdaptationTrainer:
             mixed.images, mixed.targets, self.config.rgb_aug
         )
         strong_images = self._rgb_photometric_aug(weak_images.clone())
-        thresh = self._get_threshold(phase, teacher="both")
+        thresh_rgb = self._get_threshold(phase, teacher="rgb")
+        thresh_ir = self._get_threshold(phase, teacher="ir")
         rgb_pseudo = None
         ir_pseudo = None
+        rgb_raw_preds = None
+        ir_raw_preds = None
         if self.config.loss.p2_rgb_teacher_weight > 0.0 or (
-            self.config.ema.mode == "aema" and self.config.teacher_update.p2_update_rgb_teacher
+            not self.config.ablation.disable_aema and self.config.teacher_update.p2_update_rgb_teacher
         ):
-            rgb_pseudo = self._teacher_pseudo_labels(self.rgb_teacher, weak_images, thresh)
+            rgb_pseudo, rgb_raw_preds = self._teacher_pseudo_labels_with_raw(
+                self.rgb_teacher, weak_images, thresh_rgb)
         if self.config.loss.p2_ir_teacher_weight > 0.0 or (
-            self.config.ema.mode == "aema" and self.config.teacher_update.p2_update_ir_teacher
+            not self.config.ablation.disable_aema and self.config.teacher_update.p2_update_ir_teacher
         ):
-            ir_pseudo = self._teacher_pseudo_labels(self.ir_teacher, weak_images, thresh)
+            ir_pseudo, ir_raw_preds = self._teacher_pseudo_labels_with_raw(
+                self.ir_teacher, weak_images, thresh_ir)
 
         det_loss, log = compute_rgb_mid_loss(
             student=self.student,
@@ -641,15 +730,23 @@ class CurriculumDomainAdaptationTrainer:
             rgb_teacher=self.rgb_teacher,
             ir_teacher=self.ir_teacher,
             config=self.config.loss,
-            conf_thresh=thresh,
+            conf_thresh=thresh_rgb,
             teacher_images=weak_images,
             rgb_pseudo_targets=rgb_pseudo,
             ir_pseudo_targets=ir_pseudo,
+            skip_empty_pseudo=self.config.ablation.skip_empty_pseudo,
         )
+
+        # Pseudo-label health monitoring
+        if rgb_pseudo is not None and rgb_raw_preds is not None:
+            self._log_pseudo_health(log, "rgb", rgb_raw_preds, rgb_pseudo)
+        if ir_pseudo is not None and ir_raw_preds is not None:
+            self._log_pseudo_health(log, "ir", ir_raw_preds, ir_pseudo)
 
         # Adversarial alignment: disc_rgb distinguishes RGB (0) vs MID (1)
         total_loss = det_loss
-        if self.disc_rgb is not None and self.config.adv.p2_adv_weight > 0.0:
+        if (self.disc_rgb is not None and self.config.adv.p2_adv_weight > 0.0
+                and not self.config.ablation.disable_adv):
             features  = self.student.get_backbone_features(strong_images)
             self._grl.set_lambda(self._get_grl_lambda(phase))
             adv_loss, adv_log = compute_adv_loss(
@@ -658,8 +755,11 @@ class CurriculumDomainAdaptationTrainer:
             )
             total_loss = det_loss + self.config.adv.p2_adv_weight * adv_loss
             log["p2_adv_loss"]  = adv_log["adv_loss"]
+            log["adversarial_loss"] = adv_log["adv_loss"]
             log["p2_disc_acc"]  = adv_log["disc_acc"]
             log["p2_grl_lambda"] = self._grl.lambda_
+        else:
+            log["adversarial_loss"] = 0.0
 
         total_loss.backward()
         log["grad_norm"] = self._clip_and_step()
@@ -740,17 +840,24 @@ class CurriculumDomainAdaptationTrainer:
         else:
             weak_images, strong_images = weak_ir, strong_ir
             n_mid_aug = 0
-        thresh = self._get_threshold(phase, teacher="both")
-        rgb_pseudo = None
-        ir_pseudo = None
-        if self.config.loss.p3_rgb_teacher_weight > 0.0 or (
-            self.config.ema.mode == "aema" and self.config.teacher_update.p3_update_rgb_teacher
-        ):
-            rgb_pseudo = self._teacher_pseudo_labels(self.rgb_teacher, weak_images, thresh)
-        if self.config.loss.p3_ir_teacher_weight > 0.0 or (
-            self.config.ema.mode == "aema" and self.config.teacher_update.p3_update_ir_teacher
-        ):
-            ir_pseudo = self._teacher_pseudo_labels(self.ir_teacher, weak_images, thresh)
+        thresh_rgb = self._get_threshold(phase, teacher="rgb")
+        thresh_ir = self._get_threshold(phase, teacher="ir")
+        rgb_pseudo_mid = None
+        ir_pseudo_ir = None
+        rgb_raw_mid = None
+        ir_raw_ir = None
+        # RGB teacher → MID slice only
+        if (self.config.loss.p3_rgb_teacher_weight > 0.0 or (
+            not self.config.ablation.disable_aema and self.config.teacher_update.p3_update_rgb_teacher
+        )) and n_mid_aug > 0:
+            rgb_pseudo_mid, rgb_raw_mid = self._teacher_pseudo_labels_with_raw(
+                self.rgb_teacher, weak_mid, thresh_rgb)
+        # IR teacher → IR slice only
+        if (self.config.loss.p3_ir_teacher_weight > 0.0 or (
+            not self.config.ablation.disable_aema and self.config.teacher_update.p3_update_ir_teacher
+        )) and (weak_ir is not None):
+            ir_pseudo_ir, ir_raw_ir = self._teacher_pseudo_labels_with_raw(
+                self.ir_teacher, weak_ir, thresh_ir)
 
         det_loss, log = compute_mid_ir_loss(
             student=self.student,
@@ -760,15 +867,23 @@ class CurriculumDomainAdaptationTrainer:
             rgb_teacher=self.rgb_teacher,
             ir_teacher=self.ir_teacher,
             config=self.config.loss,
-            conf_thresh=thresh,
+            conf_thresh=thresh_rgb,
             teacher_images=weak_images,
-            rgb_pseudo_targets=rgb_pseudo,
-            ir_pseudo_targets=ir_pseudo,
+            rgb_pseudo_targets_mid=rgb_pseudo_mid,
+            ir_pseudo_targets_ir=ir_pseudo_ir,
+            skip_empty_pseudo=self.config.ablation.skip_empty_pseudo,
         )
+
+        # Pseudo-label health monitoring (domain-specialized)
+        if rgb_pseudo_mid is not None and rgb_raw_mid is not None:
+            self._log_pseudo_health(log, "rgb_mid", rgb_raw_mid, rgb_pseudo_mid)
+        if ir_pseudo_ir is not None and ir_raw_ir is not None:
+            self._log_pseudo_health(log, "ir_ir", ir_raw_ir, ir_pseudo_ir)
 
         # Adversarial alignment: disc_ir distinguishes MID (0) vs IR (1)
         total_loss = det_loss
-        if self.disc_ir is not None and self.config.adv.p3_adv_weight > 0.0:
+        if (self.disc_ir is not None and self.config.adv.p3_adv_weight > 0.0
+                and not self.config.ablation.disable_adv):
             features  = self.student.get_backbone_features(strong_images)
             self._grl.set_lambda(self._get_grl_lambda(phase))
             adv_loss, adv_log = compute_adv_loss(
@@ -777,30 +892,25 @@ class CurriculumDomainAdaptationTrainer:
             )
             total_loss = det_loss + self.config.adv.p3_adv_weight * adv_loss
             log["p3_adv_loss"]   = adv_log["adv_loss"]
+            log["adversarial_loss"] = adv_log["adv_loss"]
             log["p3_disc_acc"]   = adv_log["disc_acc"]
             log["p3_grl_lambda"] = self._grl.lambda_
+        else:
+            log["adversarial_loss"] = 0.0
 
         total_loss.backward()
         log["grad_norm"] = self._clip_and_step()
         if self.disc_optimizer is not None:
             self.disc_optimizer.step()
 
-        if self.config.teacher_update.p3_update_rgb_teacher:
-            self._teacher_update(
-                teacher_name="rgb",
-                teacher=self.rgb_teacher,
-                updater=self.rgb_aema,
-                images=weak_images[n_mid_aug:],
-                pseudo_targets=rgb_pseudo[n_mid_aug:] if rgb_pseudo is not None else None,
-                log=log,
-            )
+        # Phase 3: only ir_teacher is updated (domain specialist for IR)
         if self.config.teacher_update.p3_update_ir_teacher:
             self._teacher_update(
                 teacher_name="ir",
                 teacher=self.ir_teacher,
                 updater=self.ir_aema,
-                images=weak_images[n_mid_aug:],
-                pseudo_targets=ir_pseudo[n_mid_aug:] if ir_pseudo is not None else None,
+                images=weak_ir if weak_ir is not None else None,
+                pseudo_targets=ir_pseudo_ir,
                 log=log,
             )
 
@@ -822,10 +932,12 @@ class CurriculumDomainAdaptationTrainer:
         strong_images = self._ir_photometric_aug(weak_images.clone())
         thresh = self._get_threshold(phase, teacher="ir")
         ir_pseudo = None
+        ir_raw_preds = None
         if self.config.loss.p4_ir_teacher_weight > 0.0 or (
-            self.config.ema.mode == "aema" and self.config.teacher_update.p4_update_ir_teacher
+            not self.config.ablation.disable_aema and self.config.teacher_update.p4_update_ir_teacher
         ):
-            ir_pseudo = self._teacher_pseudo_labels(self.ir_teacher, weak_images, thresh)
+            ir_pseudo, ir_raw_preds = self._teacher_pseudo_labels_with_raw(
+                self.ir_teacher, weak_images, thresh)
 
         loss, log = compute_ir_loss(
             student=self.student,
@@ -835,7 +947,13 @@ class CurriculumDomainAdaptationTrainer:
             conf_thresh=thresh,
             teacher_images=weak_images,
             ir_pseudo_targets=ir_pseudo,
+            skip_empty_pseudo=self.config.ablation.skip_empty_pseudo,
         )
+
+        # Pseudo-label health monitoring
+        if ir_pseudo is not None and ir_raw_preds is not None:
+            self._log_pseudo_health(log, "ir", ir_raw_preds, ir_pseudo)
+        log["adversarial_loss"] = 0.0
 
         loss.backward()
         log["grad_norm"] = self._clip_and_step()

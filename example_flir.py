@@ -46,6 +46,7 @@ from adaptive_threshold import (
     ThreshRampConfig,
 )
 from config import (
+    AblationConfig,
     AdvConfig,
     CurriculumConfig,
     EMAConfig,
@@ -209,6 +210,12 @@ def make_training_config(
     phase1_end: int = 15_000,
     phase2_end: int = 20_000,
     phase3_end: int = 25_000,
+    skip_empty_pseudo: bool = True,
+    disable_aema: bool = False,
+    disable_adv: bool = False,
+    disable_teacher_student_merge: bool = False,
+    merge_iou_threshold: float = 0.5,
+    merge_student_conf_thresh: float = 0.7,
 ) -> TrainingConfig:
     return TrainingConfig(
         ema=EMAConfig(
@@ -219,6 +226,8 @@ def make_training_config(
             aema_slow_alpha=aema_slow_alpha,
             aema_top_ratio=aema_top_ratio,
             aema_update_interval=aema_update_interval,
+            merge_iou_threshold=merge_iou_threshold,
+            merge_student_conf_thresh=merge_student_conf_thresh,
         ),
         saga=SAGAConfig(apply_prob=1.0),   # SAGA applied 100% in MID phase
         rgb_aug=RGBAugConfig(
@@ -280,32 +289,44 @@ def make_training_config(
         pseudo_label_conf_thresh=0.7,
         device=device,
         log_interval=100,
+        ablation=AblationConfig(
+            skip_empty_pseudo=skip_empty_pseudo,
+            disable_aema=disable_aema,
+            disable_adv=disable_adv,
+            disable_teacher_student_merge=disable_teacher_student_merge,
+        ),
     )
 
 
-def make_adaptive_threshold() -> AdaptiveThresholdScheduler:
+def make_adaptive_threshold(
+    phase4_ramp_enabled: bool = False,
+    phase4_thresh_person: float = 0.55,
+    phase4_thresh_car: float = 0.65,
+    phase4_thresh_bicycle: float = 0.50,
+) -> AdaptiveThresholdScheduler:
     # FLIR classes: 0=person  1=car  2=bicycle
     # person: harder to detect in IR → lower threshold
     # car: most distinct in IR → higher threshold
     # bicycle: small, rare → lower threshold
+    phase4_base = {0: phase4_thresh_person, 1: phase4_thresh_car, 2: phase4_thresh_bicycle}
     return AdaptiveThresholdScheduler(AdaptiveThresholdConfig(
         rgb_teacher=TeacherThresholds(
             phase1={0: 0.70, 1: 0.70, 2: 0.65},
             phase2={0: 0.70, 1: 0.75, 2: 0.65},
             phase3={0: 0.70, 1: 0.75, 2: 0.65},
-            phase4={0: 0.75, 1: 0.75, 2: 0.70},
+            phase4=phase4_base,
         ),
         ir_teacher=TeacherThresholds(
             phase1={0: 0.70, 1: 0.70, 2: 0.65},
             phase2={0: 0.70, 1: 0.75, 2: 0.65},
             phase3={0: 0.70, 1: 0.75, 2: 0.65},
-            phase4={0: 0.75, 1: 0.75, 2: 0.70},   # base (overridden by ramp below)
+            phase4=phase4_base,
         ),
         phase4_ir_ramp=ThreshRampConfig(
-            enabled=True,
+            enabled=phase4_ramp_enabled,
             # per-class: person(0) / car(1) / bicycle(2)
-            start={0: 0.75, 1: 0.75, 2: 0.70},  # threshold lúc vào Phase 4
-            end  ={0: 0.85, 1: 0.90, 2: 0.80},  # threshold tối đa sau ramp_steps
+            start={0: phase4_thresh_person, 1: phase4_thresh_car, 2: phase4_thresh_bicycle},
+            end  ={0: 0.85, 1: 0.90, 2: 0.80},
             ramp_steps=10_000,
         ),
     ))
@@ -402,7 +423,12 @@ def main(args):
     )
 
     # --- Adaptive threshold ---
-    thresh = make_adaptive_threshold()
+    thresh = make_adaptive_threshold(
+        phase4_ramp_enabled=args.phase4_threshold_ramp,
+        phase4_thresh_person=args.phase4_thresh_person,
+        phase4_thresh_car=args.phase4_thresh_car,
+        phase4_thresh_bicycle=args.phase4_thresh_bicycle,
+    )
     logger.info("\n" + thresh.summary())
 
     # --- Evaluator ---
@@ -424,6 +450,12 @@ def main(args):
         phase1_end=args.phase1_end,
         phase2_end=args.phase2_end,
         phase3_end=args.phase3_end,
+        skip_empty_pseudo=not args.no_skip_empty_pseudo,
+        disable_aema=args.disable_aema,
+        disable_adv=args.disable_adv or args.adv_weight == 0.0,
+        disable_teacher_student_merge=args.disable_teacher_student_merge,
+        merge_iou_threshold=args.merge_iou_threshold,
+        merge_student_conf_thresh=args.merge_student_conf_thresh,
     )
     logger.info(
         f"Teacher update: mode={_cfg.ema.mode}  ema_alpha={_cfg.ema.alpha}  "
@@ -498,6 +530,7 @@ def main(args):
         threshold_scheduler=thresh,
         phase_evaluator=phase_eval,
         phase1_best_path=os.path.join(args.output_dir, "best_PHASE1_RGB_WARMUP.pt"),
+        phase2_best_path=os.path.join(args.output_dir, "best_PHASE2_RGB_MID.pt"),
         disc_rgb=disc_rgb,
         disc_ir=disc_ir,
         disc_optimizer=disc_optimizer,
@@ -707,6 +740,29 @@ def parse_args():
                    help="Skip baseline/final/periodic validation for fast smoke runs")
     p.add_argument("--device",      default="cuda",
                    choices=["cuda", "cpu", "mps"])
+    # --- Ablation / debug flags ---
+    p.add_argument("--disable_aema", "--disable-aema", action="store_true",
+                   help="Fall back to classic EMA instead of AEMA")
+    p.add_argument("--disable_adv", "--disable-adv", action="store_true",
+                   help="Disable adversarial domain alignment (GRL)")
+    p.add_argument("--disable_teacher_student_merge", "--disable-teacher-student-merge",
+                   action="store_true",
+                   help="Use teacher-only pseudo for AEMA importance (no DDT merge)")
+    p.add_argument("--no_skip_empty_pseudo", "--no-skip-empty-pseudo", action="store_true",
+                   help="Do NOT skip all-empty pseudo batches (default: skip is enabled)")
+    p.add_argument("--phase4_threshold_ramp", "--phase4-threshold-ramp", action="store_true",
+                   help="Enable Phase-4 linear threshold ramp-up (disabled by default)")
+    p.add_argument("--phase4_thresh_person", "--phase4-thresh-person", type=float, default=0.55,
+                   help="Phase-4 IR confidence threshold for person (default 0.55)")
+    p.add_argument("--phase4_thresh_car", "--phase4-thresh-car", type=float, default=0.65,
+                   help="Phase-4 IR confidence threshold for car (default 0.65)")
+    p.add_argument("--phase4_thresh_bicycle", "--phase4-thresh-bicycle", type=float, default=0.50,
+                   help="Phase-4 IR confidence threshold for bicycle (default 0.50)")
+    p.add_argument("--merge_iou_threshold", "--merge-iou-threshold", type=float, default=0.5,
+                   help="IoU threshold for teacher-student pseudo merge (default 0.5)")
+    p.add_argument("--merge_student_conf_thresh", "--merge-student-conf-thresh",
+                   type=float, default=0.7,
+                   help="Min confidence for student detections in merge (default 0.7)")
     return p.parse_args()
 
 

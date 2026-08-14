@@ -2,7 +2,7 @@
 Curriculum Domain Adaptation: RGB → MID(SAGA) → IR
 """
 
-from batch_types import IRBatch, MidBatch, RGBBatch
+from batch_types import IRBatch, MidIrBatch, RGBBatch, RgbMidBatch
 from config import (
     CurriculumConfig,
     EMAConfig,
@@ -14,7 +14,7 @@ from config import (
     TrainingConfig,
 )
 from ema import copy_student_to_teacher, ema_update
-from losses import compute_ir_loss, compute_mid_loss, compute_rgb_loss
+from losses import compute_ir_loss, compute_mid_ir_loss, compute_rgb_loss, compute_rgb_mid_loss
 from saga import SemanticAwareGrayAugmentation
 from scheduler import CurriculumScheduler, DomainStep, Phase
 from trainer import CurriculumDomainAdaptationTrainer
@@ -46,11 +46,13 @@ __all__ = [
     "copy_student_to_teacher",
     # Losses
     "compute_rgb_loss",
-    "compute_mid_loss",
+    "compute_mid_ir_loss",
+    "compute_rgb_mid_loss",
     "compute_ir_loss",
     # Batch types
     "RGBBatch",
-    "MidBatch",
+    "MidIrBatch",
+    "RgbMidBatch",
     "IRBatch",
     # FCOS
     "FCOSDetector",

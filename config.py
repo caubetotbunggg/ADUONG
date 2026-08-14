@@ -29,6 +29,10 @@ class EMAConfig:
     aema_top_ratio: float = 0.10
     aema_update_interval: int = 2
 
+    # Teacher-student pseudo-label merge (DDT-style)
+    merge_iou_threshold: float = 0.50       # IoU above this = duplicate → skip
+    merge_student_conf_thresh: float = 0.70  # min confidence for student detections
+
     def __post_init__(self) -> None:
         if self.mode not in {"ema", "aema"}:
             raise ValueError("EMAConfig.mode must be 'ema' or 'aema'")
@@ -40,6 +44,10 @@ class EMAConfig:
             raise ValueError("EMAConfig.aema_top_ratio must be in (0, 1]")
         if self.aema_update_interval < 1:
             raise ValueError("EMAConfig.aema_update_interval must be >= 1")
+        if not 0.0 <= self.merge_iou_threshold <= 1.0:
+            raise ValueError("EMAConfig.merge_iou_threshold must be in [0, 1]")
+        if not 0.0 <= self.merge_student_conf_thresh <= 1.0:
+            raise ValueError("EMAConfig.merge_student_conf_thresh must be in [0, 1]")
 
 
 @dataclass
@@ -190,6 +198,30 @@ class TeacherUpdateConfig:
     p4_update_ir_teacher:  bool = True
 
 
+
+
+# ---------------------------------------------------------------------------
+# Ablation / debug config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AblationConfig:
+    """
+    Toggles for ablation experiments and debugging.
+
+    All flags default to the *safe* training configuration:
+      skip_empty_pseudo         : skip all-empty pseudo batches (default ON)
+      disable_aema              : fall back to classic EMA instead of AEMA
+      disable_adv               : disable adversarial domain alignment (GRL)
+      disable_teacher_student_merge : use teacher-only pseudo for AEMA importance
+      phase4_threshold_ramp     : enable Phase-4 linear threshold ramp-up
+    """
+    skip_empty_pseudo:             bool = True
+    disable_aema:                  bool = False
+    disable_adv:                   bool = False
+    disable_teacher_student_merge: bool = False
+    phase4_threshold_ramp:         bool = False
+
 # ---------------------------------------------------------------------------
 # Top-level config
 # ---------------------------------------------------------------------------
@@ -205,6 +237,7 @@ class TrainingConfig:
     loss: LossConfig = field(default_factory=LossConfig)
     teacher_update: TeacherUpdateConfig = field(default_factory=TeacherUpdateConfig)
     adv: AdvConfig = field(default_factory=AdvConfig)
+    ablation: AblationConfig = field(default_factory=AblationConfig)
 
     pseudo_label_conf_thresh: float = 0.7   # min score to keep a pseudo-label box
     grad_clip: float = 10.0                 # max gradient norm (0 = disabled)
