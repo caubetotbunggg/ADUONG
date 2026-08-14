@@ -493,9 +493,10 @@ def main(args):
         use_schedule=not args.no_grl_schedule,
     )
 
-    # --- Adversarial discriminators (None when adv_weight=0) ---
+    # --- Adversarial discriminators (None when adv_weight=0 or --disable_adv) ---
     disc_rgb = disc_ir = disc_optimizer = None
-    if args.adv_weight > 0.0:
+    adv_effectively_disabled = args.disable_adv or args.adv_weight == 0.0
+    if args.adv_weight > 0.0 and not args.disable_adv:
         disc_rgb = DomainDiscriminator(
             in_features=config.adv.backbone_dim,
             hidden=config.adv.disc_hidden,
@@ -515,6 +516,8 @@ def main(args):
             f"grl_lambda={args.grl_lambda}  "
             f"schedule={'DANN' if not args.no_grl_schedule else 'fixed'}"
         )
+    elif args.disable_adv:
+        logger.info("Adversarial training OFF  (--disable_adv)")
     else:
         logger.info("Adversarial training OFF  (--adv_weight 0)")
 
