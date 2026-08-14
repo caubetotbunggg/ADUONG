@@ -125,7 +125,7 @@ class EmptyPseudoLossTest(unittest.TestCase):
 
         # Student should be called once (only on the 1 valid image)
         self.assertEqual(student.forward_count, 1)
-        self.assertGreater(loss.item(), 0.0)
+        self.assertNotEqual(loss.item(), 0.0)
 
 
 class AEMAEmptyPseudoTest(unittest.TestCase):

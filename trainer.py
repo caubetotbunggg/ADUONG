@@ -747,7 +747,7 @@ class CurriculumDomainAdaptationTrainer:
         total_loss = det_loss
         if (self.disc_rgb is not None and self.config.adv.p2_adv_weight > 0.0
                 and not self.config.ablation.disable_adv):
-            features  = self.student.get_backbone_features(strong_images)
+            features  = self._unwrap(self.student).get_backbone_features(strong_images)
             self._grl.set_lambda(self._get_grl_lambda(phase))
             adv_loss, adv_log = compute_adv_loss(
                 features, self.disc_rgb, self._grl, n_a=mixed.n_rgb,
@@ -884,7 +884,7 @@ class CurriculumDomainAdaptationTrainer:
         total_loss = det_loss
         if (self.disc_ir is not None and self.config.adv.p3_adv_weight > 0.0
                 and not self.config.ablation.disable_adv):
-            features  = self.student.get_backbone_features(strong_images)
+            features  = self._unwrap(self.student).get_backbone_features(strong_images)
             self._grl.set_lambda(self._get_grl_lambda(phase))
             adv_loss, adv_log = compute_adv_loss(
                 features, self.disc_ir, self._grl, n_a=n_mid_aug,

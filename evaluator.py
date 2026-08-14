@@ -24,6 +24,10 @@ from adaptive_threshold import AdaptiveThresholdScheduler
 logger = logging.getLogger(__name__)
 
 
+def _unwrap(model):
+    return model.module if isinstance(model, (nn.DataParallel,)) else model
+
+
 # ---------------------------------------------------------------------------
 # Core AP computation
 # ---------------------------------------------------------------------------

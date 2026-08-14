@@ -37,6 +37,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from adaptive_threshold import (
@@ -407,6 +408,14 @@ def main(args):
         student, rgb_teacher, ir_teacher = build_fcos_trio(**_trio_kwargs)
     copy_student_to_teacher(rgb_teacher, student)
     copy_student_to_teacher(ir_teacher,  student)
+
+    # --- Multi-GPU: wrap with DataParallel if >1 GPU ---
+    n_gpus = torch.cuda.device_count() if device_str == "cuda" else 0
+    if n_gpus > 1:
+        logger.info(f"Multi-GPU: wrapping models with DataParallel ({n_gpus} GPUs)")
+        student    = nn.DataParallel(student)
+        rgb_teacher = nn.DataParallel(rgb_teacher)
+        ir_teacher  = nn.DataParallel(ir_teacher)
 
     # --- Optimizer ---
     optimizer = torch.optim.SGD([

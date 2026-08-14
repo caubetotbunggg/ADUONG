@@ -27,6 +27,8 @@ def ema_update(
                        This prevents the teacher from diverging too fast at
                        the very start when the student is still random.
     """
+    teacher = _unwrap(teacher)
+    student = _unwrap(student)
     if global_step is not None:
         # Warmup: alpha ramps from ~0.09 → target_alpha over first ~10k steps
         warmup_alpha = (1.0 + global_step) / (10.0 + global_step)
@@ -318,13 +320,15 @@ class AEMAUpdater:
                 )
             filt_pseudo = merged_pseudo
 
+        raw_teacher = _unwrap(teacher)
+        raw_student = _unwrap(student)
         was_training = teacher.training
-        requires_grad = [p.requires_grad for p in teacher.parameters()]
-        for p in teacher.parameters():
+        requires_grad = [p.requires_grad for p in raw_teacher.parameters()]
+        for p in raw_teacher.parameters():
             p.requires_grad_(True)
         teacher.train()
-        teacher.apply(_set_batchnorm_eval)
-        teacher.zero_grad(set_to_none=True)
+        raw_teacher.apply(_set_batchnorm_eval)
+        raw_teacher.zero_grad(set_to_none=True)
 
         clean_targets = _strip_scores(filt_pseudo)
         loss_dict = teacher(filt_images, clean_targets)
@@ -332,7 +336,7 @@ class AEMAUpdater:
         importance_loss.backward()
 
         with torch.no_grad():
-            for name, param in teacher.named_parameters():
+            for name, param in raw_teacher.named_parameters():
                 if param.grad is None:
                     continue
                 grad = param.grad.detach().abs()
@@ -341,8 +345,8 @@ class AEMAUpdater:
                 self.grad_accum[name].add_(grad)
 
         log["aema_importance_loss"] = float(importance_loss.detach().item())
-        teacher.zero_grad(set_to_none=True)
-        for param, old_requires_grad in zip(teacher.parameters(), requires_grad):
+        raw_teacher.zero_grad(set_to_none=True)
+        for param, old_requires_grad in zip(raw_teacher.parameters(), requires_grad):
             param.requires_grad_(old_requires_grad)
         teacher.train(was_training)
 
@@ -352,6 +356,8 @@ class AEMAUpdater:
         return log
 
     def _apply_update(self, teacher: nn.Module, student: nn.Module) -> Dict[str, float]:
+        teacher = _unwrap(teacher)
+        student = _unwrap(student)
         t_params = dict(teacher.named_parameters())
         s_params = dict(student.named_parameters())
         t_bufs = dict(teacher.named_buffers())
@@ -427,8 +433,15 @@ class AEMAUpdater:
         }
 
 
+def _unwrap(model: nn.Module) -> nn.Module:
+    """Unwrap nn.DataParallel if present."""
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
 def copy_student_to_teacher(teacher: nn.Module, student: nn.Module) -> None:
     """Hard copy student weights into teacher (alpha=0). Used for initialization."""
+    teacher = _unwrap(teacher)
+    student = _unwrap(student)
     with torch.no_grad():
         for t_p, s_p in zip(teacher.parameters(), student.parameters()):
             t_p.data.copy_(s_p.data)
