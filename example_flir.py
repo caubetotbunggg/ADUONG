@@ -221,6 +221,7 @@ def make_training_config(
     aat_enabled: bool = False,
     aat_epsilon: float = 0.02,
     aat_merge_iou: float = 0.5,
+    aat_mode: str = "statistical",
 ) -> TrainingConfig:
     return TrainingConfig(
         ema=EMAConfig(
@@ -302,6 +303,7 @@ def make_training_config(
         ),
         aat=AATConfig(
             enabled=aat_enabled,
+            mode=aat_mode,
             epsilon=aat_epsilon,
             merge_iou=aat_merge_iou,
         ),
@@ -491,6 +493,7 @@ def main(args):
         aat_enabled=args.enable_aat,
         aat_epsilon=args.aat_epsilon,
         aat_merge_iou=args.aat_merge_iou,
+        aat_mode=args.aat_mode,
     )
     logger.info(
         f"Teacher update: mode={_cfg.ema.mode}  ema_alpha={_cfg.ema.alpha}  "
@@ -783,6 +786,9 @@ def parse_args():
                    help="AAT perturbation budget (default 0.02)")
     p.add_argument("--aat_merge_iou", "--aat-merge-iou", type=float, default=0.5,
                    help="IoU threshold for merging clean + attacked pseudo (default 0.5)")
+    p.add_argument("--aat_mode", "--aat-mode", default="statistical",
+                   choices=["statistical", "discriminator"],
+                   help="AAT attack mode: statistical (no disc) or discriminator (needs --adv_weight > 0)")
     p.add_argument("--device",      default="cuda",
                    choices=["cuda", "cpu", "mps"])
     # --- Ablation / debug flags ---

@@ -174,12 +174,85 @@ class StatisticalDomainAttacker:
         return attacked
 
 
+
+class DiscriminatorDomainAttacker:
+    """
+    Perturb images toward the IR domain using discriminator gradient.
+
+    Uses the domain discriminator (DANN-style) to guide the attack:
+    the gradient of the discriminator's domain classification loss w.r.t.
+    input images indicates the direction to push images toward IR.
+
+    Requires a trained discriminator (--adv_weight > 0).
+
+    Usage:
+        attacker = DiscriminatorDomainAttacker(
+            backbone_fn=student.get_backbone_features,
+            discriminator=disc_ir,
+            epsilon=0.02,
+        )
+        attacked = attacker.attack(images, target_domain=1)  # 1 = IR
+    """
+
+    def __init__(
+        self,
+        backbone_fn,
+        discriminator: nn.Module,
+        epsilon: float = 0.02,
+        clamp_min: float = 0.0,
+        clamp_max: float = 1.0,
+    ) -> None:
+        self.backbone_fn = backbone_fn
+        self.discriminator = discriminator
+        self.epsilon = epsilon
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+
+    def attack(self, images: torch.Tensor, target_domain: int = 1) -> torch.Tensor:
+        """
+        Perturb images so discriminator classifies them as target_domain.
+
+        Args:
+            images:        [B, C, H, W] input images
+            target_domain:  0 = MID (source), 1 = IR (target)
+
+        Returns:
+            attacked_images: [B, C, H, W] perturbed toward target domain
+        """
+        images_grad = images.detach().clone().requires_grad_(True)
+
+        # Extract backbone features (gradient flows to images)
+        features = self.backbone_fn(images_grad)
+
+        # Discriminator classifies domain
+        logits = self.discriminator(features)  # [B, 2]
+
+        # Loss: make discriminator think these are target domain
+        target_labels = torch.full(
+            (images.shape[0],), target_domain, dtype=torch.long,
+            device=images.device,
+        )
+        loss = F.cross_entropy(logits, target_labels)
+
+        grad = torch.autograd.grad(loss, images_grad)[0]
+        # Move toward target domain (minimise loss → subtract gradient)
+        attacked = (images - self.epsilon * grad.sign()).detach()
+        attacked = attacked.clamp(self.clamp_min, self.clamp_max)
+        return attacked
+
+    def update_ir_stats(self, ir_images: torch.Tensor, momentum: float = 0.9) -> None:
+        """No-op for discriminator mode (uses discriminator directly)."""
+        pass
+
 class AATPseudoLabelGenerator:
     """
     Generate pseudo-labels using Adversarial Attacked Teacher.
 
-    Combines clean teacher predictions with attacked teacher predictions
-    (statistical domain match attack) and merges them via IoU dedup.
+    Supports two attack modes:
+      - "statistical": perturb toward IR mean/std (no discriminator needed)
+      - "discriminator": use DANN discriminator gradient to push toward IR
+
+    Both modes merge clean + attacked teacher predictions via IoU dedup.
     """
 
     def __init__(
@@ -188,16 +261,34 @@ class AATPseudoLabelGenerator:
         merge_iou_threshold: float = 0.5,
         clamp_min: float = 0.0,
         clamp_max: float = 1.0,
+        mode: str = "statistical",
+        backbone_fn=None,
+        discriminator: Optional[nn.Module] = None,
+        target_domain: int = 1,
     ) -> None:
-        self.attacker = StatisticalDomainAttacker(
-            epsilon=epsilon,
-            clamp_min=clamp_min,
-            clamp_max=clamp_max,
-        )
+        self.mode = mode
         self.merge_iou_threshold = merge_iou_threshold
+        self.target_domain = target_domain
+
+        if mode == "discriminator":
+            assert backbone_fn is not None, "discriminator mode requires backbone_fn"
+            assert discriminator is not None, "discriminator mode requires discriminator"
+            self.attacker = DiscriminatorDomainAttacker(
+                backbone_fn=backbone_fn,
+                discriminator=discriminator,
+                epsilon=epsilon,
+                clamp_min=clamp_min,
+                clamp_max=clamp_max,
+            )
+        else:
+            self.attacker = StatisticalDomainAttacker(
+                epsilon=epsilon,
+                clamp_min=clamp_min,
+                clamp_max=clamp_max,
+            )
 
     def update_ir_stats(self, ir_images: torch.Tensor, momentum: float = 0.9) -> None:
-        """Update IR reference statistics. Call with real IR batches."""
+        """Update IR reference statistics (statistical mode only)."""
         self.attacker.update_ir_stats(ir_images, momentum)
 
     def generate(
@@ -221,7 +312,10 @@ class AATPseudoLabelGenerator:
         clean_pseudo = filter_pseudo_labels(clean_preds, conf_thresh)
 
         # --- Attacked predictions ---
-        attacked_images = self.attacker.attack(images)
+        if self.mode == "discriminator":
+            attacked_images = self.attacker.attack(images, target_domain=self.target_domain)
+        else:
+            attacked_images = self.attacker.attack(images)
         with torch.no_grad():
             attacked_preds = teacher(attacked_images)
         attacked_pseudo = filter_pseudo_labels(attacked_preds, conf_thresh)

@@ -140,14 +140,36 @@ class CurriculumDomainAdaptationTrainer:
         # AAT (Adversarial Attacked Teacher) — statistical domain match
         self.aat_generator: Optional[AATPseudoLabelGenerator] = None
         if config.aat.enabled:
-            self.aat_generator = AATPseudoLabelGenerator(
-                epsilon=config.aat.epsilon,
-                merge_iou_threshold=config.aat.merge_iou,
-            )
-            logger.info(
-                f"AAT enabled: epsilon={config.aat.epsilon}  "
-                f"merge_iou={config.aat.merge_iou}"
-            )
+            if config.aat.mode == "discriminator":
+                # Discriminator-guided attack: needs backbone + disc
+                assert self.disc_ir is not None, (
+                    "AAT discriminator mode requires --adv_weight > 0 "
+                    "(disc_ir must exist)"
+                )
+                backbone_fn = self._unwrap(self.student).get_backbone_features
+                self.aat_generator = AATPseudoLabelGenerator(
+                    epsilon=config.aat.epsilon,
+                    merge_iou_threshold=config.aat.merge_iou,
+                    mode="discriminator",
+                    backbone_fn=backbone_fn,
+                    discriminator=self.disc_ir,
+                    target_domain=config.aat.target_domain,
+                )
+                logger.info(
+                    f"AAT enabled (discriminator): epsilon={config.aat.epsilon}  "
+                    f"merge_iou={config.aat.merge_iou}  "
+                    f"target_domain={config.aat.target_domain}"
+                )
+            else:
+                self.aat_generator = AATPseudoLabelGenerator(
+                    epsilon=config.aat.epsilon,
+                    merge_iou_threshold=config.aat.merge_iou,
+                    mode="statistical",
+                )
+                logger.info(
+                    f"AAT enabled (statistical): epsilon={config.aat.epsilon}  "
+                    f"merge_iou={config.aat.merge_iou}"
+                )
 
         # Infinite data iterators — never exhaust
         self._rgb_iter: Iterator = self._infinite(rgb_loader)

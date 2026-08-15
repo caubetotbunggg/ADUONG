@@ -221,9 +221,11 @@ class AATConfig:
     ir_stats_momentum : EMA momentum for updating IR reference statistics (0.9 = slow)
     """
     enabled: bool = False
+    mode: str = "statistical"            # "statistical" or "discriminator"
     epsilon: float = 0.02
     merge_iou: float = 0.5
     ir_stats_momentum: float = 0.9
+    target_domain: int = 1              # 1=IR (for discriminator mode)
 
 # ---------------------------------------------------------------------------
 # Ablation / debug config
