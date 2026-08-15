@@ -183,6 +183,11 @@ class CurriculumDomainAdaptationTrainer:
     # Setup
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _unwrap(model: nn.Module) -> nn.Module:
+        """Unwrap nn.DataParallel if present, for accessing custom methods."""
+        return model.module if isinstance(model, nn.DataParallel) else model
+
     def _setup_models(self) -> None:
         """Move models to device; freeze & eval teachers; move discriminators."""
         for model in (self.student, self.rgb_teacher, self.ir_teacher):
