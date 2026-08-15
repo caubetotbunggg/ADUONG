@@ -1103,7 +1103,7 @@ class CurriculumDomainAdaptationTrainer:
             "rgb_aema":    self.rgb_aema.state_dict(),
             "ir_aema":     self.ir_aema.state_dict(),
         }
-        if self.aat_generator is not None:
+        if self.aat_generator is not None and hasattr(self.aat_generator.attacker, '_ir_mean'):
             ckpt["aat_ir_mean"] = self.aat_generator.attacker._ir_mean
             ckpt["aat_ir_std"] = self.aat_generator.attacker._ir_std
         if self.disc_rgb is not None:
@@ -1124,7 +1124,7 @@ class CurriculumDomainAdaptationTrainer:
         self.rgb_teacher.load_state_dict(ckpt["rgb_teacher"])
         self.ir_teacher.load_state_dict(ckpt["ir_teacher"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
-        if self.aat_generator is not None:
+        if self.aat_generator is not None and hasattr(self.aat_generator.attacker, '_ir_mean'):
             if "aat_ir_mean" in ckpt and ckpt["aat_ir_mean"] is not None:
                 self.aat_generator.attacker._ir_mean = ckpt["aat_ir_mean"].to(self.device)
                 self.aat_generator.attacker._ir_std = ckpt["aat_ir_std"].to(self.device)
