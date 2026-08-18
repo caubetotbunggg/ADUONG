@@ -134,6 +134,7 @@ def visualize_eval_samples(
     samples_targets: List[Dict]        = []
     samples_preds: List[Dict]          = []
 
+    _was_training = model.training
     model.eval()
     with torch.no_grad():
         for batch in val_loader:
@@ -153,7 +154,7 @@ def visualize_eval_samples(
             if len(samples_images) >= num_samples:
                 break
 
-    model.train()
+    model.train(_was_training)
 
     n    = len(samples_images)
     rows = math.ceil(n / cols)
@@ -241,6 +242,7 @@ def visualize_compare_models(
     samples_targets: List[Dict]         = []
 
     first_model = next(iter(models.values()))
+    _first_was = first_model.training
     first_model.eval()
     with torch.no_grad():
         for batch in val_loader:
@@ -254,13 +256,14 @@ def visualize_compare_models(
                                         for k, v in targets[i].items()})
             if len(samples_images) >= num_samples:
                 break
-    first_model.train()
+    first_model.train(_first_was)
 
     n = len(samples_images)
 
     # --- run inference for each model ---
     all_preds: Dict[str, List[Dict]] = {}
     for name, model in models.items():
+        _was = model.training
         model.eval()
         preds_list: List[Dict] = []
         with torch.no_grad():
@@ -277,7 +280,7 @@ def visualize_compare_models(
                     collected += 1
                 if collected >= n:
                     break
-        model.train()
+        model.train(_was)
         all_preds[name] = preds_list
 
     # --- draw grid: rows=images, cols=models ---
