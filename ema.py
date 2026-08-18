@@ -27,8 +27,6 @@ def ema_update(
                        This prevents the teacher from diverging too fast at
                        the very start when the student is still random.
     """
-    teacher = _unwrap(teacher)
-    student = _unwrap(student)
     if global_step is not None:
         # Warmup: alpha ramps from ~0.09 → target_alpha over first ~10k steps
         warmup_alpha = (1.0 + global_step) / (10.0 + global_step)
@@ -50,8 +48,6 @@ def ema_update(
         for name, t_b in t_bufs.items():
             if name in s_bufs and t_b.is_floating_point():
                 t_b.data.mul_(alpha).add_(s_bufs[name].data, alpha=1.0 - alpha)
-            elif name in s_bufs and not t_b.is_floating_point():
-                t_b.data.copy_(s_bufs[name].data)
 
 
 def _strip_scores(targets: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
