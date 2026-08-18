@@ -1,0 +1,19 @@
+# Core ML libraries
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Image I/O
+Pillow>=9.0.0
+opencv-python>=4.5.0
+
+# Numerical computing
+numpy>=1.20.0
+scipy>=1.7.0
+
+# Visualization & video
+matplotlib>=3.5.0
+imageio>=2.9.0
+imageio-ffmpeg>=0.4.5
+
+# Utilities
+tqdm>=4.60.0
