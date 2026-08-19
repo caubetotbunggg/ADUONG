@@ -213,7 +213,27 @@ class CurriculumDomainAdaptationTrainer:
           - Freeze cả 2 teachers (chuyển sang EMA mode).
           - Init student từ rgb_teacher weights.
         """
+        # --- Resume (--resume) enters with from_phase=None ---
         if from_phase is None:
+            if to_phase == Phase.PHASE1_RGB_WARMUP:
+                # Fresh start at step 0: nothing to do (teachers train, student frozen).
+                return
+            # Resume into Phase 2/3: ensure teachers are frozen+eval and student
+            # is trainable (model mode / requires_grad are NOT saved in checkpoints).
+            self._freeze_teachers()
+            if to_phase == Phase.PHASE2_RGB_MID and self.global_step == self.config.curriculum.phase1_end:
+                # Resumed exactly at the Phase1->2 boundary: the checkpoint student is
+                # still the untrained Phase-1 student -> init it from rgb_teacher, exactly
+                # like a fresh Phase1->2 transition.
+                logger.info("[Resume at PHASE1->2] freezing teachers, init student from rgb_teacher")
+                self._unfreeze_student()
+            else:
+                # Resumed mid-Phase2 / Phase3: student is already trained -> keep its
+                # weights, only flip requires_grad + train mode.
+                logger.info(f"[Resume into {to_phase.name}] freeze teachers, unfreeze student (keep weights)")
+                for _p in self.student.parameters():
+                    _p.requires_grad = True
+                self.student.train()
             return
         if from_phase == Phase.PHASE1_RGB_WARMUP and to_phase == Phase.PHASE2_RGB_MID:
             logger.info("[Phase transition] PHASE1 → PHASE2: freezing teachers, init student")
